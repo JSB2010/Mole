@@ -264,6 +264,72 @@ opt_startup_items_cleanup() {
         return 0
     fi
 
+    local dry_run="${DRY_RUN:-false}"
+
+    resolve_program_path() {
+        local plist_file="$1"
+        local program_path=""
+
+        program_path=$(plutil -extract Program raw "$plist_file" 2> /dev/null || true)
+        if [[ -z "$program_path" ]]; then
+            program_path=$(plutil -extract ProgramArguments.0 raw "$plist_file" 2> /dev/null || true)
+        fi
+
+        program_path="${program_path/#\~/$HOME}"
+
+        if [[ "$program_path" == *'$'* || "$program_path" != /* ]]; then
+            echo ""
+            return
+        fi
+
+        echo "$program_path"
+    }
+
+    remove_startup_item() {
+        local plist_file="$1"
+        local program_path="$2"
+        local need_sudo="$3"
+        local reason="$4"
+
+        local display_name
+        display_name=$(basename "$plist_file")
+
+        if [[ "$dry_run" == "true" ]]; then
+            ((broken_count++))
+            echo -e "  ${YELLOW}!${NC} Dry run: would remove $display_name ${GRAY}(${reason})${NC}"
+            return
+        fi
+
+        local plist_removed=false
+        if [[ "$need_sudo" == "true" ]]; then
+            sudo launchctl unload "$plist_file" 2> /dev/null || true
+            if safe_sudo_remove "$plist_file"; then
+                plist_removed=true
+            else
+                echo -e "  ${YELLOW}!${NC} Failed to remove (sudo) $plist_file"
+            fi
+        else
+            launchctl unload "$plist_file" 2> /dev/null || true
+            if safe_remove "$plist_file" true; then
+                plist_removed=true
+            else
+                echo -e "  ${YELLOW}!${NC} Failed to remove $plist_file"
+            fi
+        fi
+
+        if [[ "$plist_removed" == "true" ]]; then
+            if [[ -n "$program_path" && -f "$program_path" ]]; then
+                if [[ "$need_sudo" == "true" ]]; then
+                    safe_sudo_remove "$program_path" || true
+                else
+                    safe_remove "$program_path" true || true
+                fi
+            fi
+            ((broken_count++))
+            echo -e "  ${GREEN}✓${NC} Removed $display_name"
+        fi
+    }
+
     local -a scan_dirs=(
         "$HOME/Library/LaunchAgents"
         "$HOME/Library/LaunchDaemons"
@@ -329,38 +395,18 @@ opt_startup_items_cleanup() {
                     continue
                 fi
 
-                if [[ "$need_sudo" == "true" ]]; then
-                    sudo launchctl unload "$plist_file" 2> /dev/null || true
-                    if safe_sudo_remove "$plist_file"; then
-                        ((broken_count++))
-                    else
-                        echo -e "  ${YELLOW}!${NC} Failed to remove (sudo) $plist_file"
-                    fi
-                else
-                    launchctl unload "$plist_file" 2> /dev/null || true
-                    if safe_remove "$plist_file" true; then
-                        ((broken_count++))
-                    else
-                        echo -e "  ${YELLOW}!${NC} Failed to remove $plist_file"
-                    fi
-                fi
+                remove_startup_item "$plist_file" "" "$need_sudo" "invalid plist"
                 continue
             fi
 
             # Extract program path
             local program=""
-            program=$(plutil -extract Program raw "$plist_file" 2> /dev/null || echo "")
-
-            if [[ -z "$program" ]]; then
-                program=$(plutil -extract ProgramArguments.0 raw "$plist_file" 2> /dev/null || echo "")
+            program=$(resolve_program_path "$plist_file")
+            local program_exists=false
+            if [[ -n "$program" && -e "$program" ]]; then
+                program_exists=true
             fi
 
-            program="${program/#\~/$HOME}"
-
-            # Skip paths with variables or non-absolute program definitions
-            if [[ "$program" == *'$'* || "$program" != /* ]]; then
-                continue
-            fi
             # Check for orphaned privileged helpers (app uninstalled but helper remains)
             local associated_bundle=""
             associated_bundle=$(plutil -extract AssociatedBundleIdentifiers.0 raw "$plist_file" 2> /dev/null || echo "")
@@ -378,19 +424,11 @@ opt_startup_items_cleanup() {
                     app_path=$(run_with_timeout 10 mdfind "kMDItemCFBundleIdentifier == '$associated_bundle'" 2> /dev/null | head -1 || echo "")
                 fi
 
-                # If associated app is MISSING, this is an orphan
-                if [[ -z "$app_path" ]]; then
+                # If associated app is MISSING and helper target is missing, treat as orphan
+                if [[ -z "$app_path" && -n "$program" && "$program_exists" == "false" ]]; then
                     if command -v should_protect_path > /dev/null && should_protect_path "$plist_file"; then
                         continue
                     fi
-
-                    # Get the helper tool path
-                    local program=""
-                    program=$(plutil -extract Program raw "$plist_file" 2> /dev/null || echo "")
-                    if [[ -z "$program" ]]; then
-                        program=$(plutil -extract ProgramArguments.0 raw "$plist_file" 2> /dev/null || echo "")
-                    fi
-                    program="${program/#\~/$HOME}"
 
                     # Double check we are not deleting system files
                     if [[ "$program" == /System/* ||
@@ -401,57 +439,28 @@ opt_startup_items_cleanup() {
                         continue
                     fi
 
-                    if [[ "$need_sudo" == "true" ]]; then
-                        sudo launchctl unload "$plist_file" 2> /dev/null || true
-                        # remove the plist
-                        safe_sudo_remove "$plist_file"
-
-                        # AND remove the helper binary if it exists and is not protected
-                        if [[ -n "$program" && -f "$program" ]]; then
-                            safe_sudo_remove "$program"
-                        fi
-                        ((broken_count++))
-                        echo -e "  ${GREEN}✓${NC} Removed orphaned helper: $(basename "$program")"
-                    else
-                        launchctl unload "$plist_file" 2> /dev/null || true
-                        safe_remove "$plist_file" true
-                        if [[ -n "$program" && -f "$program" ]]; then
-                            safe_remove "$program" true
-                        fi
-                        ((broken_count++))
-                        echo -e "  ${GREEN}✓${NC} Removed orphaned helper: $(basename "$program")"
-                    fi
+                    remove_startup_item "$plist_file" "$program" "$need_sudo" "missing associated app and executable"
                     continue
                 fi
             fi
 
             # If program doesn't exist, remove the launch agent/daemon
-            if [[ -n "$program" && ! -e "$program" ]]; then
+            if [[ -n "$program" && "$program_exists" == "false" ]]; then
                 if command -v should_protect_path > /dev/null && should_protect_path "$plist_file"; then
                     continue
                 fi
 
-                if [[ "$need_sudo" == "true" ]]; then
-                    sudo launchctl unload "$plist_file" 2> /dev/null || true
-                    if safe_sudo_remove "$plist_file"; then
-                        ((broken_count++))
-                    else
-                        echo -e "  ${YELLOW}!${NC} Failed to remove (sudo) $plist_file"
-                    fi
-                else
-                    launchctl unload "$plist_file" 2> /dev/null || true
-                    if safe_remove "$plist_file" true; then
-                        ((broken_count++))
-                    else
-                        echo -e "  ${YELLOW}!${NC} Failed to remove $plist_file"
-                    fi
-                fi
+                remove_startup_item "$plist_file" "$program" "$need_sudo" "missing executable"
             fi
         done < <("${find_cmd[@]}" "$dir" -maxdepth 1 -name "*.plist" -type f 2> /dev/null || true)
     done
 
     if [[ $broken_count -gt 0 ]]; then
-        echo -e "  ${GREEN}✓${NC} Removed $broken_count broken startup items"
+        if [[ "$dry_run" == "true" ]]; then
+            echo -e "  ${YELLOW}!${NC} Dry run: $broken_count startup items would be removed"
+        else
+            echo -e "  ${GREEN}✓${NC} Removed $broken_count broken startup items"
+        fi
     fi
 
     if [[ $total_count -gt 0 ]]; then

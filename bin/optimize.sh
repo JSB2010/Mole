@@ -6,6 +6,8 @@ set -euo pipefail
 export LC_ALL=C
 export LANG=C
 
+DRY_RUN=false
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$SCRIPT_DIR/lib/core/common.sh"
 
@@ -317,6 +319,9 @@ main() {
             "--debug")
                 export MO_DEBUG=1
                 ;;
+            "--dry-run" | "-n")
+                DRY_RUN=true
+                ;;
             "--whitelist")
                 manage_whitelist "optimize"
                 exit 0
@@ -371,6 +376,10 @@ main() {
 
     show_system_health "$health_json"
 
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo -e "${YELLOW}Dry Run Mode${NC} - Preview only, no changes will be made"
+    fi
+
     load_whitelist "optimize"
     if [[ ${#CURRENT_WHITELIST_PATTERNS[@]} -gt 0 ]]; then
         local count=${#CURRENT_WHITELIST_PATTERNS[@]}
@@ -406,6 +415,21 @@ main() {
             confirm_items+=("$item")
         fi
     done < "$opts_file"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo ""
+        if [[ ${#safe_items[@]} -eq 0 && ${#confirm_items[@]} -eq 0 ]]; then
+            echo -e "  ${GREEN}✓${NC} No optimizations scheduled"
+        else
+            echo -e "  ${YELLOW}!${NC} Planned optimizations (dry run)"
+            for item in "${safe_items[@]}" "${confirm_items[@]}"; do
+                [[ -z "$item" ]] && continue
+                IFS='|' read -r name desc _ <<< "$item"
+                echo -e "    - ${name} - ${desc}"
+            done
+        fi
+        exit 0
+    fi
 
     echo ""
     ensure_sudo_session "System optimization requires admin access" || true
